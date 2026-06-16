@@ -6,14 +6,27 @@ que Oracle tenga capacidad disponible.
 
 Si la instancia ya existe (porque una corrida anterior tuvo éxito), el script
 no hace nada y termina con éxito.
+
+Maneja tres tipos de fallo de forma distinta:
+- Sin capacidad ("Out of host capacity"): esperado, termina con exit code 1
+  para que el cron de GitHub Actions reintente en 10 minutos.
+- Timeout de red transitorio: reintenta unas pocas veces dentro de la misma
+  corrida (con espera corta) antes de rendirse con exit code 1.
+- Cualquier otro error (credenciales, formato, etc.): error real, se imprime
+  el detalle completo para depurar.
 """
 
 import os
 import sys
-import base64
+import time
 import tempfile
 
 import oci
+
+# Cuántas veces reintentar dentro de esta misma corrida ante un timeout de red,
+# y cuánto esperar entre intentos (en segundos).
+NETWORK_RETRY_ATTEMPTS = 3
+NETWORK_RETRY_WAIT_SECONDS = 15
 
 
 def get_env(name: str) -> str:
@@ -30,9 +43,7 @@ def build_config() -> dict:
 
     # OCI SDK espera una ruta a archivo de clave, así que la escribimos a un
     # archivo temporal.
-    key_file = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".pem", delete=False
-    )
+    key_file = tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False)
     key_file.write(private_key_content)
     key_file.close()
     os.chmod(key_file.name, 0o600)
@@ -78,13 +89,42 @@ def get_latest_ubuntu_arm_image(compute_client, compartment_id: str) -> str:
     return images[0].id
 
 
-def main():
-    config = build_config()
+def is_out_of_capacity_error(e: "oci.exceptions.ServiceError") -> bool:
+    message = str(getattr(e, "message", ""))
+    code = str(getattr(e, "code", ""))
+    return (
+        "Out of capacity" in message
+        or "Out of host capacity" in message
+        or "OutOfCapacity" in code
+    )
 
+
+def print_service_error_details(e: "oci.exceptions.ServiceError") -> None:
+    print(f"❌ Error inesperado de la API de Oracle: {e}")
+    print("--- Detalle completo de la excepción ---")
+    print(f"status: {e.status}")
+    print(f"code: {e.code}")
+    print(f"message: {e.message}")
+    print(f"operation_name: {e.operation_name}")
+    print(f"target_service: {e.target_service}")
+    print(f"request_endpoint: {getattr(e, 'request_endpoint', 'N/A')}")
+
+
+def run_attempt(config: dict) -> bool:
+    """
+    Ejecuta un intento completo: revisar si ya existe, buscar imagen, y lanzar
+    la instancia. Devuelve True si terminó con éxito (instancia creada o ya
+    existente), False si fue un "Out of host capacity" (caso esperado para
+    reintentar más tarde vía cron).
+
+    Cualquier otro error real (credenciales, formato, etc.) termina el proceso
+    inmediatamente con sys.exit(1).
+    """
     compartment_id = get_env("OCI_TENANCY_OCID")  # compartimento raíz
     subnet_id = get_env("OCI_SUBNET_OCID")
     availability_domain = get_env("OCI_AVAILABILITY_DOMAIN")
     display_name = os.environ.get("OCI_INSTANCE_NAME", "pasatedigital")
+
     ssh_public_key = get_env("OCI_SSH_PUBLIC_KEY").strip()
     # Por si la clave llegó con múltiples líneas o saltos de línea accidentales,
     # la colapsamos a una sola línea (un .pub válido siempre es una sola línea).
@@ -102,18 +142,6 @@ def main():
 
     image_id = get_latest_ubuntu_arm_image(compute_client, compartment_id)
     print(f"Usando imagen: {image_id}")
-
-    # --- Depuración: mostramos exactamente lo que vamos a enviar ---
-    print("--- Valores usados para el launch ---")
-    print(f"availability_domain: {availability_domain!r}")
-    print(f"compartment_id: {compartment_id!r}")
-    print(f"subnet_id: {subnet_id!r}")
-    print(f"ocpus: {ocpus!r} ({type(ocpus)})")
-    print(f"memory_gb: {memory_gb!r} ({type(memory_gb)})")
-    print(f"boot_volume_gb: {boot_volume_gb!r} ({type(boot_volume_gb)})")
-    print(f"ssh_public_key (primeros 40 chars): {ssh_public_key[:40]!r}")
-    print(f"ssh_public_key (longitud): {len(ssh_public_key)}")
-    print("--------------------------------------")
 
     launch_details = oci.core.models.LaunchInstanceDetails(
         availability_domain=availability_domain,
@@ -137,36 +165,49 @@ def main():
         },
     )
 
-    try:
-        print("Intentando crear la instancia...")
-        response = compute_client.launch_instance(launch_details)
-        print("✅ ¡Instancia creada con éxito!")
-        print(f"OCID: {response.data.id}")
-        print(f"Estado: {response.data.lifecycle_state}")
-        sys.exit(0)
+    print("Intentando crear la instancia...")
+    response = compute_client.launch_instance(launch_details)
+    print("✅ ¡Instancia creada con éxito!")
+    print(f"OCID: {response.data.id}")
+    print(f"Estado: {response.data.lifecycle_state}")
+    sys.exit(0)
 
-    except oci.exceptions.ServiceError as e:
-        sin_capacidad = (
-            "Out of capacity" in str(e.message)
-            or "Out of host capacity" in str(e.message)
-            or "OutOfCapacity" in str(e.code)
-        )
-        if sin_capacidad:
-            print("⏳ Sin capacidad disponible todavía. Se reintentará en la próxima corrida.")
-            sys.exit(1)  # falla "esperada", el workflow seguirá reintentando
-        else:
-            print(f"❌ Error inesperado de la API de Oracle: {e}")
-            print(f"--- Detalle completo de la excepción ---")
-            print(f"status: {e.status}")
-            print(f"code: {e.code}")
-            print(f"message: {e.message}")
-            print(f"operation_name: {e.operation_name}")
-            print(f"target_service: {e.target_service}")
-            print(f"request_endpoint: {getattr(e, 'request_endpoint', 'N/A')}")
+
+def main():
+    config = build_config()
+
+    for attempt in range(1, NETWORK_RETRY_ATTEMPTS + 1):
+        try:
+            run_attempt(config)
+            return  # run_attempt termina el proceso por sí mismo (sys.exit)
+
+        except oci.exceptions.ServiceError as e:
+            if is_out_of_capacity_error(e):
+                print("⏳ Sin capacidad disponible todavía. Se reintentará en la próxima corrida.")
+                sys.exit(1)  # falla "esperada", el workflow (cron) seguirá reintentando
+            else:
+                print_service_error_details(e)
+                sys.exit(1)
+
+        except (oci.exceptions.ConnectTimeout, oci.exceptions.RequestException) as e:
+            print(
+                f"⏳ Intento {attempt}/{NETWORK_RETRY_ATTEMPTS}: "
+                f"problema de red transitorio al hablar con Oracle."
+            )
+            print(f"Detalle: {e}")
+            if attempt < NETWORK_RETRY_ATTEMPTS:
+                print(f"Esperando {NETWORK_RETRY_WAIT_SECONDS}s antes de reintentar...")
+                time.sleep(NETWORK_RETRY_WAIT_SECONDS)
+            else:
+                print(
+                    "Se agotaron los reintentos de red en esta corrida. "
+                    "El cron volverá a intentar en 10 minutos."
+                )
+                sys.exit(1)
+
+        except Exception as e:
+            print(f"❌ Error no esperado: {type(e).__name__}: {e}")
             sys.exit(1)
-    except Exception as e:
-        print(f"❌ Error no esperado (no es ServiceError): {type(e).__name__}: {e}")
-        sys.exit(1)
 
 
 if __name__ == "__main__":
