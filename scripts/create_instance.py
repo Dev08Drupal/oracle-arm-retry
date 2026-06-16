@@ -146,7 +146,12 @@ def main():
         sys.exit(0)
 
     except oci.exceptions.ServiceError as e:
-        if "Out of capacity" in str(e.message) or "OutOfCapacity" in str(e.code):
+        sin_capacidad = (
+            "Out of capacity" in str(e.message)
+            or "Out of host capacity" in str(e.message)
+            or "OutOfCapacity" in str(e.code)
+        )
+        if sin_capacidad:
             print("⏳ Sin capacidad disponible todavía. Se reintentará en la próxima corrida.")
             sys.exit(1)  # falla "esperada", el workflow seguirá reintentando
         else:
