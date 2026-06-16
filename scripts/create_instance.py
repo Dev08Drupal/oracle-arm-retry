@@ -85,7 +85,10 @@ def main():
     subnet_id = get_env("OCI_SUBNET_OCID")
     availability_domain = get_env("OCI_AVAILABILITY_DOMAIN")
     display_name = os.environ.get("OCI_INSTANCE_NAME", "pasatedigital")
-    ssh_public_key = get_env("OCI_SSH_PUBLIC_KEY")
+    ssh_public_key = get_env("OCI_SSH_PUBLIC_KEY").strip()
+    # Por si la clave llegó con múltiples líneas o saltos de línea accidentales,
+    # la colapsamos a una sola línea (un .pub válido siempre es una sola línea).
+    ssh_public_key = " ".join(ssh_public_key.split())
 
     ocpus = float(os.environ.get("OCI_OCPUS", "4"))
     memory_gb = float(os.environ.get("OCI_MEMORY_GB", "24"))
@@ -99,6 +102,18 @@ def main():
 
     image_id = get_latest_ubuntu_arm_image(compute_client, compartment_id)
     print(f"Usando imagen: {image_id}")
+
+    # --- Depuración: mostramos exactamente lo que vamos a enviar ---
+    print("--- Valores usados para el launch ---")
+    print(f"availability_domain: {availability_domain!r}")
+    print(f"compartment_id: {compartment_id!r}")
+    print(f"subnet_id: {subnet_id!r}")
+    print(f"ocpus: {ocpus!r} ({type(ocpus)})")
+    print(f"memory_gb: {memory_gb!r} ({type(memory_gb)})")
+    print(f"boot_volume_gb: {boot_volume_gb!r} ({type(boot_volume_gb)})")
+    print(f"ssh_public_key (primeros 40 chars): {ssh_public_key[:40]!r}")
+    print(f"ssh_public_key (longitud): {len(ssh_public_key)}")
+    print("--------------------------------------")
 
     launch_details = oci.core.models.LaunchInstanceDetails(
         availability_domain=availability_domain,
@@ -136,7 +151,17 @@ def main():
             sys.exit(1)  # falla "esperada", el workflow seguirá reintentando
         else:
             print(f"❌ Error inesperado de la API de Oracle: {e}")
+            print(f"--- Detalle completo de la excepción ---")
+            print(f"status: {e.status}")
+            print(f"code: {e.code}")
+            print(f"message: {e.message}")
+            print(f"operation_name: {e.operation_name}")
+            print(f"target_service: {e.target_service}")
+            print(f"request_endpoint: {getattr(e, 'request_endpoint', 'N/A')}")
             sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error no esperado (no es ServiceError): {type(e).__name__}: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
