@@ -6,6 +6,9 @@ on:
     - cron: "*/10 * * * *"
   workflow_dispatch: {}  # te permite correrlo manualmente desde la pestaña Actions
 
+permissions:
+  contents: write  # necesario para comitear state.json de vuelta al repo
+
 jobs:
   intentar-crear-instancia:
     runs-on: ubuntu-latest
@@ -22,6 +25,7 @@ jobs:
         run: pip install oci
 
       - name: Intentar crear la instancia ARM
+        id: intento
         env:
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
@@ -35,4 +39,23 @@ jobs:
           OCI_OCPUS: "4"
           OCI_MEMORY_GB: "24"
           OCI_BOOT_VOLUME_GB: "50"
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
+        # continue-on-error: el script termina con exit 1 en casos esperados
+        # ("sin capacidad todavía"), eso no debe marcar el workflow como roto.
+        continue-on-error: true
         run: python scripts/create_instance.py
+
+      - name: Guardar estado actualizado (state.json)
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [[ -n "$(git status --porcelain state.json 2>/dev/null)" ]]; then
+            git add state.json
+            git commit -m "chore: actualizar estado de reintento [skip ci]"
+            git push
+          else
+            echo "Sin cambios en state.json, no se hace commit."
+          fi
