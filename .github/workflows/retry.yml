@@ -46,6 +46,7 @@ jobs:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
+          STATE_FILE_PATH: ${{ github.workspace }}/state.json
         # continue-on-error: el script termina con exit 1 en casos esperados
         # ("sin capacidad todavía"), eso no debe marcar el workflow como roto.
         continue-on-error: true
