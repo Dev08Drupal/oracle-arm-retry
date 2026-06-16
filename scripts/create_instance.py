@@ -4,8 +4,14 @@ Script que intenta crear una instancia VM.Standard.A1.Flex (ARM, Always Free)
 en Oracle Cloud. Pensado para correr repetidamente desde GitHub Actions hasta
 que Oracle tenga capacidad disponible.
 
-Si la instancia ya existe (porque una corrida anterior tuvo éxito), el script
-no hace nada y termina con éxito.
+Envía 3 tipos de correo (vía scripts/notify.py):
+- Inicio: una sola vez, en la primera corrida del workflow.
+- Resumen: cada ~12 horas mientras sigue intentando, con el número de intentos.
+- Éxito: cuando la instancia se crea (incluye OCID e IP, y también cierra el flujo).
+
+El estado entre corridas (si ya se envió el correo de inicio, cuántos intentos
+van, etc.) se guarda en scripts/state.py / state.json, que el workflow de
+GitHub Actions debe comitear de vuelta al repo tras cada corrida.
 
 Maneja tres tipos de fallo de forma distinta:
 - Sin capacidad ("Out of host capacity"): esperado, termina con exit code 1
@@ -23,10 +29,16 @@ import tempfile
 
 import oci
 
+from notify import send_email
+from state import load_state, save_state, now_iso, hours_since
+
 # Cuántas veces reintentar dentro de esta misma corrida ante un timeout de red,
 # y cuánto esperar entre intentos (en segundos).
 NETWORK_RETRY_ATTEMPTS = 3
 NETWORK_RETRY_WAIT_SECONDS = 15
+
+# Cada cuántas horas se envía el correo de resumen mientras se sigue intentando.
+SUMMARY_INTERVAL_HOURS = 12
 
 
 def get_env(name: str) -> str:
@@ -41,8 +53,6 @@ def build_config() -> dict:
     """Construye el config de OCI a partir de variables de entorno (secrets)."""
     private_key_content = get_env("OCI_PRIVATE_KEY")
 
-    # OCI SDK espera una ruta a archivo de clave, así que la escribimos a un
-    # archivo temporal.
     key_file = tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False)
     key_file.write(private_key_content)
     key_file.close()
@@ -59,16 +69,28 @@ def build_config() -> dict:
     return config
 
 
-def instance_already_exists(compute_client, compartment_id: str, display_name: str) -> bool:
-    """Revisa si ya existe una instancia con ese nombre (evita duplicados)."""
+def instance_already_exists(compute_client, compartment_id: str, display_name: str):
+    """Devuelve la instancia si ya existe con ese nombre (evita duplicados), o None."""
     response = compute_client.list_instances(compartment_id=compartment_id)
     for instance in response.data:
         if instance.display_name == display_name and instance.lifecycle_state not in (
             "TERMINATED",
             "TERMINATING",
         ):
-            return True
-    return False
+            return instance
+    return None
+
+
+def get_public_ip(compute_client, network_client, compartment_id: str, instance_id: str) -> str:
+    """Busca la IP pública asociada a la VNIC primaria de la instancia."""
+    vnic_attachments = compute_client.list_vnic_attachments(
+        compartment_id=compartment_id, instance_id=instance_id
+    ).data
+    for attachment in vnic_attachments:
+        vnic = network_client.get_vnic(vnic_id=attachment.vnic_id).data
+        if vnic.public_ip:
+            return vnic.public_ip
+    return "(sin IP pública asignada todavía, revisa la consola)"
 
 
 def get_latest_ubuntu_arm_image(compute_client, compartment_id: str) -> str:
@@ -110,15 +132,58 @@ def print_service_error_details(e: "oci.exceptions.ServiceError") -> None:
     print(f"request_endpoint: {getattr(e, 'request_endpoint', 'N/A')}")
 
 
-def run_attempt(config: dict) -> bool:
+def send_success_email(instance, public_ip: str, state: dict) -> None:
+    subject = "✅ Tu instancia Oracle ARM ya está creada"
+    body = (
+        "¡Buenas noticias! Tu instancia VM.Standard.A1.Flex (4 OCPU, 24GB RAM) "
+        "ya fue creada en Oracle Cloud.\n\n"
+        f"Nombre: {instance.display_name}\n"
+        f"OCID: {instance.id}\n"
+        f"Estado: {instance.lifecycle_state}\n"
+        f"IP pública: {public_ip}\n\n"
+        f"Intentos totales hasta lograrlo: {state['attempts']}\n\n"
+        "Próximo paso: conéctate por SSH con tu clave privada:\n"
+        f"  ssh -i tu_clave_privada.key ubuntu@{public_ip}\n\n"
+        "El workflow de reintento ya no es necesario, puedes desactivarlo "
+        "desde la pestaña Actions → ⋯ → Disable workflow.\n\n"
+        "Este es el último correo de este proceso. ¡Listo!"
+    )
+    send_email(subject, body)
+
+
+def send_start_email(state: dict) -> None:
+    subject = "🚀 Iniciando reintento automático de instancia Oracle ARM"
+    body = (
+        "Se acaba de activar el proceso de reintento automático para crear tu "
+        "instancia VM.Standard.A1.Flex (4 OCPU, 24GB RAM) en Oracle Cloud.\n\n"
+        "El script intentará crear la instancia cada 10 minutos hasta que haya "
+        "capacidad disponible.\n\n"
+        f"Hora de inicio (UTC): {state['started_at']}\n\n"
+        f"Recibirás un correo de resumen cada {SUMMARY_INTERVAL_HOURS} horas, "
+        "y un correo final cuando la instancia se cree con éxito."
+    )
+    send_email(subject, body)
+
+
+def send_summary_email(state: dict) -> None:
+    elapsed = hours_since(state["started_at"])
+    subject = f"📊 Resumen: {state['attempts']} intentos en {elapsed:.1f}h"
+    body = (
+        "Resumen del proceso de reintento automático de tu instancia Oracle ARM.\n\n"
+        f"Tiempo transcurrido: {elapsed:.1f} horas\n"
+        f"Intentos realizados: {state['attempts']}\n"
+        "Estado: todavía sin capacidad disponible en Oracle, el script sigue "
+        "reintentando automáticamente cada 10 minutos.\n\n"
+        "No necesitas hacer nada, te avisaremos en cuanto se cree la instancia."
+    )
+    send_email(subject, body)
+
+
+def run_attempt(config: dict, state: dict):
     """
     Ejecuta un intento completo: revisar si ya existe, buscar imagen, y lanzar
-    la instancia. Devuelve True si terminó con éxito (instancia creada o ya
-    existente), False si fue un "Out of host capacity" (caso esperado para
-    reintentar más tarde vía cron).
-
-    Cualquier otro error real (credenciales, formato, etc.) termina el proceso
-    inmediatamente con sys.exit(1).
+    la instancia. Si tiene éxito (instancia nueva o ya existente), envía el
+    correo de éxito y termina el proceso con sys.exit(0).
     """
     compartment_id = get_env("OCI_TENANCY_OCID")  # compartimento raíz
     subnet_id = get_env("OCI_SUBNET_OCID")
@@ -126,8 +191,6 @@ def run_attempt(config: dict) -> bool:
     display_name = os.environ.get("OCI_INSTANCE_NAME", "pasatedigital")
 
     ssh_public_key = get_env("OCI_SSH_PUBLIC_KEY").strip()
-    # Por si la clave llegó con múltiples líneas o saltos de línea accidentales,
-    # la colapsamos a una sola línea (un .pub válido siempre es una sola línea).
     ssh_public_key = " ".join(ssh_public_key.split())
 
     ocpus = float(os.environ.get("OCI_OCPUS", "4"))
@@ -135,9 +198,16 @@ def run_attempt(config: dict) -> bool:
     boot_volume_gb = int(os.environ.get("OCI_BOOT_VOLUME_GB", "50"))
 
     compute_client = oci.core.ComputeClient(config)
+    network_client = oci.core.VirtualNetworkClient(config)
 
-    if instance_already_exists(compute_client, compartment_id, display_name):
-        print(f"La instancia '{display_name}' ya existe. No se hace nada más.")
+    existing = instance_already_exists(compute_client, compartment_id, display_name)
+    if existing:
+        print(f"La instancia '{display_name}' ya existe.")
+        public_ip = get_public_ip(compute_client, network_client, compartment_id, existing.id)
+        if not state["finished"]:
+            send_success_email(existing, public_ip, state)
+            state["finished"] = True
+            save_state(state)
         sys.exit(0)
 
     image_id = get_latest_ubuntu_arm_image(compute_client, compartment_id)
@@ -167,24 +237,61 @@ def run_attempt(config: dict) -> bool:
 
     print("Intentando crear la instancia...")
     response = compute_client.launch_instance(launch_details)
+    instance = response.data
     print("✅ ¡Instancia creada con éxito!")
-    print(f"OCID: {response.data.id}")
-    print(f"Estado: {response.data.lifecycle_state}")
+    print(f"OCID: {instance.id}")
+    print(f"Estado: {instance.lifecycle_state}")
+
+    # La IP pública puede tardar unos segundos en estar lista en la VNIC;
+    # si no aparece todavía, el correo lo indica y se puede ver en la consola.
+    public_ip = get_public_ip(compute_client, network_client, compartment_id, instance.id)
+    send_success_email(instance, public_ip, state)
+    state["finished"] = True
+    save_state(state)
     sys.exit(0)
 
 
 def main():
+    state = load_state()
+
+    # Primera corrida: registramos hora de inicio y enviamos correo de bienvenida.
+    if state["started_at"] is None:
+        state["started_at"] = now_iso()
+
+    state["attempts"] += 1
+
+    if not state["start_email_sent"]:
+        send_start_email(state)
+        state["start_email_sent"] = True
+
+    # Correo de resumen cada SUMMARY_INTERVAL_HOURS horas.
+    last_summary = state["last_summary_email_at"]
+    should_send_summary = (
+        last_summary is None
+        and hours_since(state["started_at"]) >= SUMMARY_INTERVAL_HOURS
+    ) or (
+        last_summary is not None
+        and hours_since(last_summary) >= SUMMARY_INTERVAL_HOURS
+    )
+    if should_send_summary and not state["finished"]:
+        send_summary_email(state)
+        state["last_summary_email_at"] = now_iso()
+
+    # Guardamos el estado ya actualizado ANTES de intentar el launch, para que
+    # quede registrado el intento incluso si la corrida falla por timeout.
+    save_state(state)
+
     config = build_config()
 
     for attempt in range(1, NETWORK_RETRY_ATTEMPTS + 1):
         try:
-            run_attempt(config)
+            run_attempt(config, state)
             return  # run_attempt termina el proceso por sí mismo (sys.exit)
 
         except oci.exceptions.ServiceError as e:
             if is_out_of_capacity_error(e):
                 print("⏳ Sin capacidad disponible todavía. Se reintentará en la próxima corrida.")
-                sys.exit(1)  # falla "esperada", el workflow (cron) seguirá reintentando
+                sys.exit(1)
             else:
                 print_service_error_details(e)
                 sys.exit(1)
