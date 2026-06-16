@@ -15,6 +15,10 @@ jobs:
     steps:
       - name: Clonar repositorio
         uses: actions/checkout@v4
+        with:
+          # Evita quedar en "detached HEAD", para que el push posterior
+          # apunte correctamente a la rama del repo.
+          ref: ${{ github.ref_name }}
 
       - name: Configurar Python
         uses: actions/setup-python@v5
@@ -45,17 +49,28 @@ jobs:
         # continue-on-error: el script termina con exit 1 en casos esperados
         # ("sin capacidad todavía"), eso no debe marcar el workflow como roto.
         continue-on-error: true
-        run: python scripts/create_instance.py
+        working-directory: scripts
+        run: python create_instance.py
+
+      - name: Verificar contenido de state.json (diagnóstico)
+        run: |
+          echo "--- state.json en la raíz del repo ---"
+          cat state.json || echo "⚠️ No se encontró state.json en la raíz."
 
       - name: Guardar estado actualizado (state.json)
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          echo "--- git status ---"
+          git status
+
           if [[ -n "$(git status --porcelain state.json 2>/dev/null)" ]]; then
             git add state.json
-            git commit -m "chore: actualizar estado de reintento [skip ci]"
-            git push
+            git commit -m "chore: actualizar estado de reintento"
+            git push origin HEAD:${{ github.ref_name }}
+            echo "✅ Push realizado."
           else
-            echo "Sin cambios en state.json, no se hace commit."
+            echo "⚠️ Sin cambios detectados en state.json, no se hizo commit."
           fi
