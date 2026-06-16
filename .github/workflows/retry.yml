@@ -54,8 +54,20 @@ jobs:
 
       - name: Verificar contenido de state.json (diagnóstico)
         run: |
-          echo "--- state.json en la raíz del repo ---"
-          cat state.json || echo "⚠️ No se encontró state.json en la raíz."
+          echo "--- Árbol completo del repo (sin .git) ---"
+          find . -path ./.git -prune -o -type f -print
+          echo ""
+          echo "--- ls -la en la raíz ---"
+          ls -la
+          echo ""
+          echo "--- ls -la en scripts/ ---"
+          ls -la scripts/
+          echo ""
+          echo "--- Contenido de ./state.json (raíz) ---"
+          cat ./state.json 2>/dev/null || echo "⚠️ No existe ./state.json"
+          echo ""
+          echo "--- Contenido de ./scripts/state.json (si existe) ---"
+          cat ./scripts/state.json 2>/dev/null || echo "(no existe scripts/state.json, esto es correcto)"
 
       - name: Guardar estado actualizado (state.json)
         if: always()
