@@ -15,7 +15,17 @@ import json
 import os
 from datetime import datetime, timezone
 
-STATE_PATH = os.environ.get("STATE_FILE_PATH", "state.json")
+# La ruta de state.json SIEMPRE se recibe explícitamente por variable de
+# entorno (definida en el workflow de GitHub Actions, apuntando a la raíz
+# del repo). Si no está definida (ej. corriendo localmente para pruebas),
+# usamos "../state.json" como respaldo, asumiendo que este archivo vive en
+# scripts/ y el repo root es un nivel arriba.
+STATE_PATH = os.environ.get("STATE_FILE_PATH")
+if not STATE_PATH:
+    _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+    STATE_PATH = os.path.join(_SCRIPTS_DIR, "..", "state.json")
+STATE_PATH = os.path.abspath(STATE_PATH)
+print(f"[state.py] Usando STATE_PATH = {STATE_PATH}")
 
 DEFAULT_STATE = {
     "started_at": None,
