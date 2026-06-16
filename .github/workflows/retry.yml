@@ -1,0 +1,38 @@
+name: Reintento Oracle ARM
+
+on:
+  schedule:
+    # Corre cada 10 minutos. GitHub puede retrasarlo un poco, es normal.
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}  # te permite correrlo manualmente desde la pestaña Actions
+
+jobs:
+  intentar-crear-instancia:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: pip install oci
+
+      - name: Intentar crear la instancia ARM
+        env:
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+          OCI_INSTANCE_NAME: "pasatedigital"
+          OCI_OCPUS: "4"
+          OCI_MEMORY_GB: "24"
+          OCI_BOOT_VOLUME_GB: "50"
+        run: python scripts/create_instance.py
